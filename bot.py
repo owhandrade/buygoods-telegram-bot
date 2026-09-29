@@ -6,7 +6,10 @@ Versão Railway (24/7) - usa variáveis de ambiente
 from flask import Flask, request, jsonify
 import requests
 import os
-from datetime import datetime
+import json
+import hmac
+from html import escape
+from datetime import datetime, timezone, timedelta
 
 app = Flask(__name__)
 
@@ -14,7 +17,10 @@ app = Flask(__name__)
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 SECRET_KEY = os.environ.get("SECRET_KEY", "minha_chave_secreta_123")
+HW_WEBHOOK_TOKEN = os.environ.get("HW_WEBHOOK_TOKEN", "")
 # ==============================================================
+
+BRT = timezone(timedelta(hours=-3))  # horário de Brasília (sem horário de verão)
 
 
 def send_telegram_message(text: str):
@@ -99,6 +105,94 @@ def buygoods_webhook():
         return jsonify({"status": "ok"}), 200
     else:
         return jsonify({"status": "error", "msg": "falha ao enviar"}), 500
+
+
+# ================== H&W HUB (hwaffiliate.com) ==================
+
+HW_EVENTS = {
+    "ORDER_PAID": ("💰", "VENDA APROVADA"),
+    "ORDER_UPSELL": ("💎", "UPSELL"),
+    "ORDER_PENDING": ("⏳", "PEDIDO PENDENTE"),
+    "ORDER_FAILED": ("❌", "PAGAMENTO RECUSADO"),
+}
+
+
+def _find(data, *keys):
+    """Procura as chaves na ordem dada (em qualquer nível do JSON) e
+    devolve o primeiro valor simples (texto/número) encontrado."""
+    for key in keys:
+        key = key.lower()
+        queue = [data]
+        while queue:
+            cur = queue.pop(0)
+            if isinstance(cur, dict):
+                for k, v in cur.items():
+                    if k.lower() == key and isinstance(v, (str, int, float)) and v != "":
+                        return v
+                queue.extend(v for v in cur.values() if isinstance(v, (dict, list)))
+            elif isinstance(cur, list):
+                queue.extend(cur)
+    return None
+
+
+def _hw_token_ok(data):
+    """Aceita o token pela URL (?token=), cabeçalho ou corpo do webhook."""
+    if not HW_WEBHOOK_TOKEN:
+        return True
+    auth = request.headers.get("Authorization", "")
+    candidates = [
+        request.args.get("token"),
+        request.headers.get("X-Webhook-Token"),
+        request.headers.get("X-Hub-Token"),
+        request.headers.get("Token"),
+        auth[7:] if auth.lower().startswith("bearer ") else auth,
+        _find(data, "token", "webhook_token", "webhookToken"),
+    ]
+    return any(
+        isinstance(c, str) and hmac.compare_digest(c, HW_WEBHOOK_TOKEN)
+        for c in candidates
+    )
+
+
+@app.route("/webhook/hw", methods=["POST"])
+def hw_webhook():
+    """Endpoint que recebe os webhooks do H&W Hub."""
+    data = request.get_json(silent=True) or request.form.to_dict() or {}
+
+    # Log completo (Railway → Deployments → Logs) para conferir o formato
+    print(f"\n[{datetime.now(BRT)}] Webhook H&W recebido:")
+    print(json.dumps(data, ensure_ascii=False, indent=2)[:4000])
+
+    if not _hw_token_ok(data):
+        print("[AVISO] Token do H&W inválido ou ausente. Ignorando.")
+        return jsonify({"status": "unauthorized"}), 401
+
+    event = str(_find(data, "event", "event_type", "eventType", "type", "status") or "")
+    emoji, tipo = HW_EVENTS.get(event.upper(), ("🔔", event.upper() or "EVENTO H&W"))
+
+    def v(*keys):
+        val = _find(data, *keys)
+        return escape(str(val)) if val is not None else "N/A"
+
+    now = datetime.now(BRT).strftime("%d/%m/%Y %H:%M:%S")
+    message = (
+        f"{emoji} <b>H&amp;W: {escape(tipo)}!</b>\n"
+        f"━━━━━━━━━━━━━━━━━━\n"
+        f"📦 <b>Oferta:</b> {v('offer_name', 'offerName', 'product_name', 'productName', 'offer', 'product')}\n"
+        f"🆔 <b>Pedido:</b> {v('order_id', 'orderId', 'order_number', 'orderNumber', 'transaction_id', 'transactionId')}\n"
+        f"💵 <b>Valor:</b> {v('amount', 'total', 'price', 'value')}\n"
+        f"🤑 <b>Comissão:</b> {v('commission', 'payout', 'affiliate_commission')}\n"
+        f"📣 <b>Campanha:</b> {v('utm_campaign', 'utmCampaign')}\n"
+        f"🔗 <b>SubID4:</b> {v('subid4', 'subId4')}\n"
+        f"🌎 <b>País:</b> {v('country', 'country_code', 'countryCode')}\n"
+        f"🕐 <b>Data:</b> {now}\n"
+        f"━━━━━━━━━━━━━━━━━━"
+    )
+
+    if send_telegram_message(message):
+        print("[OK] Mensagem H&W enviada com sucesso!")
+        return jsonify({"status": "ok"}), 200
+    return jsonify({"status": "error", "msg": "falha ao enviar"}), 500
 
 
 @app.route("/health", methods=["GET"])
