@@ -159,9 +159,8 @@ def hw_webhook():
     """Endpoint que recebe os webhooks do H&W Hub."""
     data = request.get_json(silent=True) or request.form.to_dict() or {}
 
-    # Log completo (Railway → Deployments → Logs) para conferir o formato
-    print(f"\n[{datetime.now(BRT)}] Webhook H&W recebido:")
-    print(json.dumps(data, ensure_ascii=False, indent=2)[:4000])
+    # Log completo em uma linha (Railway → Deployments → Logs) para conferir o formato
+    print(f"[{datetime.now(BRT)}] Webhook H&W recebido: {json.dumps(data, ensure_ascii=False)}")
 
     if not _hw_token_ok(data):
         print("[AVISO] Token do H&W inválido ou ausente. Ignorando.")
