@@ -6,7 +6,6 @@ Versão Railway (24/7) - usa variáveis de ambiente
 from flask import Flask, request, jsonify
 import requests
 import os
-import json
 import hmac
 from html import escape
 from datetime import datetime, timezone, timedelta
@@ -154,36 +153,93 @@ def _hw_token_ok(data):
     )
 
 
+def _get(d, *path):
+    """Lê um caminho no JSON (ex.: _get(data, "order", "utm", "utm_campaign"))."""
+    for p in path:
+        if isinstance(d, dict):
+            d = d.get(p)
+        elif isinstance(d, list) and isinstance(p, int) and -len(d) <= p < len(d):
+            d = d[p]
+        else:
+            return None
+    return d
+
+
+def _money(value, currency=""):
+    if not isinstance(value, (int, float)):
+        return None
+    prefix = {"USD": "US$ ", "BRL": "R$ ", "EUR": "€ "}.get(str(currency).upper(), "")
+    suffix = "" if prefix or not currency else f" {currency}"
+    return f"{prefix}{value:,.2f}{suffix}"
+
+
 @app.route("/webhook/hw", methods=["POST"])
 def hw_webhook():
     """Endpoint que recebe os webhooks do H&W Hub."""
     data = request.get_json(silent=True) or request.form.to_dict() or {}
 
-    # Log completo em uma linha (Railway → Deployments → Logs) para conferir o formato
-    print(f"[{datetime.now(BRT)}] Webhook H&W recebido: {json.dumps(data, ensure_ascii=False)}")
-
     if not _hw_token_ok(data):
-        print("[AVISO] Token do H&W inválido ou ausente. Ignorando.")
+        print(f"[{datetime.now(BRT)}] [AVISO] Webhook H&W com token inválido ou ausente. Ignorando.")
         return jsonify({"status": "unauthorized"}), 401
 
-    event = str(_find(data, "event", "event_type", "eventType", "type", "status") or "")
-    emoji, tipo = HW_EVENTS.get(event.upper(), ("🔔", event.upper() or "EVENTO H&W"))
+    body = data.get("data") if isinstance(data.get("data"), dict) else data
+    order = body.get("order") if isinstance(body.get("order"), dict) else body
+    event = str(data.get("event") or _find(data, "event", "eventType", "event_type") or "")
+    products = [p for p in (order.get("products") or []) if isinstance(p, dict)]
+    commissions = [c for c in (body.get("commissions") or order.get("commissions") or []) if isinstance(c, dict)]
+    currency = order.get("currency") or ""
+    is_upsell = event.upper() == "ORDER_UPSELL" or any(p.get("isUpsell") for p in products)
+    is_test = bool(order.get("isTest") or data.get("isTest"))
 
-    def v(*keys):
-        val = _find(data, *keys)
-        return escape(str(val)) if val is not None else "N/A"
+    # Log resumido (sem dados do cliente)
+    order_ref = order.get("orderNumber") or order.get("id") or "N/A"
+    print(f"[{datetime.now(BRT)}] Webhook H&W: event={event} pedido={order_ref} teste={is_test}")
+
+    emoji, tipo = HW_EVENTS.get(event.upper(), ("🔔", event.upper() or "EVENTO H&W"))
+    if is_upsell and event.upper() == "ORDER_PAID":
+        emoji, tipo = HW_EVENTS["ORDER_UPSELL"]
+
+    # Oferta: nome da oferta (se vier) ou nome dos produtos
+    offer_names = [o.get("name") for o in (body.get("offers") or order.get("offers") or []) if isinstance(o, dict) and o.get("name")]
+    product_names = [f"{p.get('name')}{' (upsell)' if p.get('isUpsell') else ''}" for p in products if p.get("name")]
+    oferta = ", ".join(offer_names or product_names) or "N/A"
+
+    # Valor da venda e sua comissão
+    valor = _money(order.get("totalAmount") or order.get("total"), currency) or "N/A"
+    if commissions:
+        net = sum(c.get("netValue") or 0 for c in commissions)
+        gross = sum(c.get("grossValue") or 0 for c in commissions)
+        comissao = f"{_money(net, currency)} (bruto {_money(gross, currency)})"
+        c0 = commissions[0]
+        if c0.get("status") == "PENDING" and c0.get("daysToRelease") is not None:
+            comissao += f"\n⏳ <b>Liberação:</b> em {c0['daysToRelease']} dias"
+    else:
+        ac = _get(products, 0, "affiliateCommission") or {}
+        net = ac.get("valueNet") if isinstance(ac, dict) else None
+        comissao = _money(net, currency) or _money(_get(body, "values", "totalNet"), currency) or "N/A"
+
+    utm = order.get("utm") if isinstance(order.get("utm"), dict) else {}
+    campanha = utm.get("utm_campaign") or "N/A"
+    origem = " / ".join(x for x in (utm.get("utm_source"), utm.get("utm_medium")) if x) or "N/A"
+    subid4 = _find(data, "subid4", "subId4") or "N/A"
+    pais = (_get(order, "customer", "shippingAddress", "country")
+            or _get(order, "customer", "billingAddress", "country") or "N/A")
+
+    def h(val):
+        return escape(str(val))
 
     now = datetime.now(BRT).strftime("%d/%m/%Y %H:%M:%S")
     message = (
-        f"{emoji} <b>H&amp;W: {escape(tipo)}!</b>\n"
+        f"{'🧪 <b>[TESTE]</b> ' if is_test else ''}{emoji} <b>H&amp;W: {h(tipo)}!</b>\n"
         f"━━━━━━━━━━━━━━━━━━\n"
-        f"📦 <b>Oferta:</b> {v('offer_name', 'offerName', 'product_name', 'productName', 'offer', 'product')}\n"
-        f"🆔 <b>Pedido:</b> {v('order_id', 'orderId', 'order_number', 'orderNumber', 'transaction_id', 'transactionId')}\n"
-        f"💵 <b>Valor:</b> {v('amount', 'total', 'price', 'value')}\n"
-        f"🤑 <b>Comissão:</b> {v('commission', 'payout', 'affiliate_commission')}\n"
-        f"📣 <b>Campanha:</b> {v('utm_campaign', 'utmCampaign')}\n"
-        f"🔗 <b>SubID4:</b> {v('subid4', 'subId4')}\n"
-        f"🌎 <b>País:</b> {v('country', 'country_code', 'countryCode')}\n"
+        f"📦 <b>Oferta:</b> {h(oferta)}\n"
+        f"🆔 <b>Pedido:</b> {h(order_ref)}\n"
+        f"💵 <b>Valor:</b> {h(valor)}\n"
+        f"🤑 <b>Comissão:</b> {comissao if commissions else h(comissao)}\n"
+        f"📣 <b>Campanha:</b> {h(campanha)}\n"
+        f"🎯 <b>Origem:</b> {h(origem)}\n"
+        f"🔗 <b>SubID4:</b> {h(subid4)}\n"
+        f"🌎 <b>País:</b> {h(pais)}\n"
         f"🕐 <b>Data:</b> {now}\n"
         f"━━━━━━━━━━━━━━━━━━"
     )
